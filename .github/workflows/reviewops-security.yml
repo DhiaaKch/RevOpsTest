@@ -1,0 +1,91 @@
+name: ReviewOps Security Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+  security-events: write
+
+jobs:
+  reviewops_scan:
+    runs-on: ubuntu-latest
+    steps:
+      # -------------------------------------------------------------------
+      # 1. Checkout
+      # -------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------
+      # 2. CodeQL — static analysis
+      # -------------------------------------------------------------------
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+        continue-on-error: true
+
+      - name: Autobuild (CodeQL)
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results
+        continue-on-error: true
+
+      # -------------------------------------------------------------------
+      # 3. Trivy — filesystem vulnerability scanner
+      # -------------------------------------------------------------------
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy.sarif
+          ignore-unfixed: true
+        continue-on-error: true
+
+      # -------------------------------------------------------------------
+      # 4. Semgrep — pattern-based static analysis
+      # -------------------------------------------------------------------
+      - name: Run Semgrep
+        run: |
+          pip install semgrep --quiet
+          semgrep scan --config auto --sarif --output semgrep.sarif || true
+        continue-on-error: true
+
+      # -------------------------------------------------------------------
+      # 5. Submit SARIF results to ReviewOps
+      # -------------------------------------------------------------------
+      - name: Submit scan results to ReviewOps
+        run: |
+          ENDPOINT="https://reviewops-4f331ac5.fastapicloud.dev/api/github-action/scan-and-review"
+
+          CODEQL_SARIF=$(find codeql-results -name "*.sarif" 2>/dev/null | head -n 1)
+
+          ARGS=(
+            -X POST "$ENDPOINT"
+            -F "repository=${{ github.repository }}"
+            -F "pr_number=${{ github.event.pull_request.number }}"
+            -F "head_sha=${{ github.event.pull_request.head.sha }}"
+          )
+
+          if [ -f "semgrep.sarif" ]; then
+            ARGS+=(-F "semgrep_sarif=@semgrep.sarif")
+          fi
+          if [ -f "trivy.sarif" ]; then
+            ARGS+=(-F "trivy_sarif=@trivy.sarif")
+          fi
+          if [ -n "$CODEQL_SARIF" ] && [ -f "$CODEQL_SARIF" ]; then
+            ARGS+=(-F "codeql_sarif=@${CODEQL_SARIF}")
+          fi
+
+          echo "Submitting to: $ENDPOINT"
+          curl --fail-with-body --retry 3 --retry-delay 5 "${ARGS[@]}"
